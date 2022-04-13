@@ -1,0 +1,182 @@
+include/group_replication.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the master info repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START SLAVE; see the 'START SLAVE Syntax' in the MySQL Manual for more information.
+[connection server1]
+[connection server1]
+CREATE TABLE t1(a int primary key);
+include/rpl_sync.inc
+CREATE PROCEDURE dml_operations()
+BEGIN
+declare x INT;
+set x=1;
+while x<300 do
+insert into t1 values (x);
+update t1 set a=x+300 where a=x;
+delete from t1 where a<310;
+set x=x+1;
+end  while;
+end$$
+
+select @@autocommit;
+@@autocommit
+1
+----call procedure----
+call dml_operations();
+
+[connection server2]
+set sql_log_bin=0;
+call mtr.add_suppression(".*Slave SQL for channel 'group_replication_applier': ... The slave coordinator and worker threads are stopped, possibly leaving data in inconsistent state*");
+call mtr.add_suppression("Error in Log_event::read_log_event()");
+set sql_log_bin=1;
+select*from t1;
+a
+143
+310
+311
+312
+313
+314
+315
+316
+317
+318
+319
+320
+321
+322
+323
+324
+325
+326
+327
+328
+329
+330
+331
+332
+333
+334
+335
+336
+337
+338
+339
+340
+341
+342
+343
+344
+345
+346
+347
+348
+349
+350
+351
+352
+353
+354
+355
+356
+357
+358
+359
+360
+361
+362
+363
+364
+365
+366
+367
+368
+369
+370
+371
+372
+373
+374
+375
+376
+377
+378
+379
+380
+381
+382
+383
+384
+385
+386
+387
+388
+389
+390
+391
+392
+393
+394
+395
+396
+397
+398
+399
+400
+401
+402
+403
+404
+405
+406
+407
+408
+409
+410
+411
+412
+413
+414
+415
+416
+417
+418
+419
+420
+421
+422
+423
+424
+425
+426
+427
+428
+429
+430
+431
+432
+433
+434
+435
+436
+437
+438
+439
+440
+441
+442
+# killing
+# Kill and restart:--group_replication_local_address=GROUP_REPLICATION_LOCAL_ADDRESS --group_replication_group_seeds=GROUP_REPLICATION_GROUP_SEEDS --group_replication_group_name=GROUP_REPLICATION_GROUP_NAME
+# restarting
+include/rpl_reconnect.inc
+[connection server_1]
+include/rpl_gr_wait_for_number_of_members.inc
+SET @@GLOBAL.group_replication_force_members= "LOCAL_ADDRESS_SERVER_1";
+[connection server2]
+include/start_group_replication.inc
+[connection server1]
+include/rpl_sync.inc
+include/diff_tables.inc [server1:t1, server2:t1]
+drop table t1;
+drop procedure dml_operations;
+include/group_replication_end.inc
