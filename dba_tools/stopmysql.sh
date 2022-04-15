@@ -25,7 +25,7 @@ fi
 
 sockfile=` grep "^socket *=" ${etcfile}  | tail -n1| awk -F"=" '{print $2}'`
 
-$base_dir/bin/mysqladmin shutdown -S ${sockfile} -uroot -proot
+$base_dir/bin/mysqladmin --shutdown-timeout=30 shutdown -S ${sockfile} -uroot -proot
 
 programe="bin/mysqld"
 cmd="ps -ef | grep ${programe} | grep -v vim | grep -v grep | grep -v defunct | grep -- 'my_${port}.cnf' | awk '{print \$2}' | head -n 1"
