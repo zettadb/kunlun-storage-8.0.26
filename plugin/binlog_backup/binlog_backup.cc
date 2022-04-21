@@ -758,6 +758,7 @@ static int binlog_backup_plugin_init(void *p) {
       key_memory_mysql_binlog_backup_context,
       sizeof(struct mysql_binlog_backup_context), MYF(0));
 
+  bzero((void*)con,sizeof(struct mysql_binlog_backup_context));
   // for srv_session_init_thd
   con->p = p;
 
