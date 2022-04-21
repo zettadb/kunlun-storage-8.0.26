@@ -3562,7 +3562,7 @@ static int args_post_process(void) {
     return ERROR_STOP;
   }
 
-  if (!raw_mode &&
+  if (raw_mode &&
       (opt_gtid_to_filepos_str == nullptr && !opt_truncate_file_by_stoptime)) {
     if (one_database)
       warning("The --database option is ignored with --raw mode");
