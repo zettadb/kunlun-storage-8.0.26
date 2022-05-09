@@ -163,13 +163,15 @@ CREATE TABLE `ddl_ops_log_template_table` (
   `schema_name` varchar(64) NOT NULL,
   `user_name` varchar(64) NOT NULL,
   `role_name` varchar(64) NOT NULL,
-  `optype` enum('create','drop','rename','alter','replace','others') NOT NULL,
+  `search_path` text NOT NULL,
+  `optype` enum('create','drop','rename','alter','replace', 'remap_shardid', 'others') NOT NULL,
   `objtype` enum('db','index','matview','partition','schema','seq','table','func','role_or_group','proc','stats','user','view', 'others') NOT NULL,
   `when_logged` timestamp(6) NULL DEFAULT current_timestamp(6),
   `sql_src` text NOT NULL,
   `sql_storage_node` text NOT NULL,
   `target_shard_id` int unsigned NOT NULL, -- no FK for perf, references shards.id
   `initiator` int unsigned NOT NULL, -- no FK for perf, references comp_nodes.id
+  `txn_id` bigint unsigned NOT NULL,
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 /*!40101 SET character_set_client = @saved_cs_client */;
@@ -187,6 +189,14 @@ CREATE TABLE `meta_db_nodes` (
   `port` smallint unsigned NOT NULL,
   `user_name` varchar(64) NOT NULL,
   `passwd` varchar(120) NOT NULL,
+  `master_priority` smallint NOT NULL DEFAULT '1',
+  `member_state` enum('source','replica') NOT NULL,
+  `sync_state` enum('fsync','async') NOT NULL,
+  `degrade_conf_state` enum('ON','OFF') NOT NULL,
+  `degrade_run_state` enum('ON','OFF') NOT NULL,
+  `replica_delay` int NOT NULL,
+  `degrade_conf_time` int NOT NULL,
+  `sync_num` smallint unsigned NOT NULL DEFAULT '1',
   UNIQUE KEY `id` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 /*!40101 SET character_set_client = @saved_cs_client */;
@@ -225,6 +235,7 @@ CREATE TABLE `server_nodes` (
   `svc_since` timestamp(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   -- the port number the node_mgr on this server is listening on, if not using default one. NULL: using default app defined port.
   nodemgr_port int,
+  nodemgr_tmp_data_abs_path text DEFAULT NULL,
   extra_props text,
   PRIMARY KEY (`id`),
   UNIQUE KEY `hostaddr_dcid_uniq` (`hostaddr`(512),`dc_id`),
@@ -334,55 +345,56 @@ CREATE TABLE `shard_nodes` (
 /*!50003 SET collation_connection  = utf8_general_ci */ ;
 /*!50003 SET @saved_sql_mode       = @@sql_mode */ ;
 /*!50003 SET sql_mode              = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION' */ ;
--- DELIMITER ;;
-CREATE PROCEDURE `append_ddl_log_entry`(tblname varchar(256), dbname varchar(64), schema_name varchar(64), role_name varchar(64), user_name varchar(64), objname varchar(64), obj_type varchar(16), op_type varchar(16), cur_opid bigint unsigned, sql_src text, sql_src_sn text, target_shardid int unsigned, initiator_id int unsigned, OUT my_opid bigint unsigned)
+CREATE PROCEDURE `append_ddl_log_entry`(
+  tblname varchar(256),
+  dbname varchar(64),
+  schema_name varchar(64),
+  role_name varchar(64),
+  user_name varchar(64),
+  search_path text,
+  objname varchar(64),
+  obj_type varchar(16),
+  op_type varchar(16),
+  cur_opid bigint unsigned,
+  sql_src text,
+  sql_src_sn text,
+  target_shardid int unsigned,
+  initiator_id int unsigned,
+  txn_id bigint unsigned,
+  OUT my_opid bigint unsigned
+)
     MODIFIES SQL DATA
     SQL SECURITY INVOKER
 BEGIN
-    DECLARE conflicts INT DEFAULT 0;
-
     set @dbname = dbname;
     set @schema_name = schema_name;
-	set @role_name = role_name;
-	set @user_name = user_name;
+	  set @role_name = role_name;
+	  set @user_name = user_name;
+	  set @search_path = search_path;
     set @objname = objname;
     set @obj_type = obj_type;
-    set @cur_opid = cur_opid;
     set @op_type = op_type;
     set @sql_src = sql_src;
     set @sql_src_sn = sql_src_sn;
     set @target_shardid = target_shardid;
     set @initiator_id = initiator_id;
-    SET @sql1 = '';
+    set @txn_id = txn_id;
 
-    if @obj_type != 'db' then
-        SET @sql1 = CONCAT('select exists(select id from ', tblname, ' where (db_name=? or (objname=? and objtype=\'db\') or objtype=\'user\') and initiator != ? and id > ? for update) into @conflicts');
-    else
-        SET @sql1 = CONCAT('select exists(select id from ', tblname, ' where (db_name=? or objtype=\'db\' or objtype=\'user\') and initiator != ? and id > ? for update) into @conflicts');
+    if COALESCE(IS_USED_LOCK('DDL'), 0) != CONNECTION_ID() then
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'DDL lock is hold by current session';
     end if;
-    
-    PREPARE stmt1 FROM @sql1;
 
-    if @obj_type != 'db' then
-        EXECUTE stmt1 USING @dbname, @dbname, @initiator_id, @cur_opid;
-    else
-        EXECUTE stmt1 USING @dbname, @initiator_id, @cur_opid;
-    end if;
-    
-    IF  @conflicts = 1 THEN
-        DEALLOCATE PREPARE stmt1;
-        set my_opid = 0;
-    ELSE
-        SET @sql2 = CONCAT('INSERT INTO ', tblname, '(db_name, schema_name, role_name, user_name, objname, objtype, optype, sql_src, sql_storage_node, target_shard_id, initiator)values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-        PREPARE stmt2 FROM @sql2;
-        EXECUTE stmt2 USING @dbname, @schema_name, @role_name, @user_name, @objname, @obj_type, @op_type, @sql_src, @sql_src_sn, @target_shardid, @initiator_id;
-        set my_opid = LAST_INSERT_ID();
-        DEALLOCATE PREPARE stmt1;
-        DEALLOCATE PREPARE stmt2;
-    END IF; 
+    SET @sql = CONCAT(
+        'INSERT INTO ',
+        tblname,
+        '(db_name, schema_name, role_name, user_name, search_path, objname, objtype, optype, sql_src, sql_storage_node, target_shard_id, initiator, txn_id)values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      );
+    PREPARE stmt FROM @sql;
+    EXECUTE stmt USING @dbname, @schema_name, @role_name, @user_name, @search_path, @objname, @obj_type, @op_type, @sql_src, @sql_src_sn, @target_shardid, @initiator_id, @txn_id;
+    set my_opid = LAST_INSERT_ID();
+    DEALLOCATE PREPARE stmt;
 END ;
--- ;;
--- delimiter ;
 /*!50003 SET sql_mode              = @saved_sql_mode */ ;
 /*!50003 SET character_set_client  = @saved_cs_client */ ;
 /*!50003 SET character_set_results = @saved_cs_results */ ;
@@ -466,15 +478,16 @@ create table cluster_shard_backup_restore_log (
 -- log them in order to recover from failures halfway.
 create table cluster_general_job_log (
 	id serial primary key,
-	job_id varchar(128) not null,
-	job_type varchar(128) not null,
+	job_id varchar(128),
+	related_id varchar(128),
+	job_type varchar(128) DEFAULT null,
 	-- an operation's status goes through the 3 phases: not_started -> ongoing -> done/failed
 	status enum ('not_started', 'ongoing', 'done', 'failed') not null default 'not_started',
 	-- extra info for expanding 
 	memo text default null,
 	when_started timestamp(6) not null default current_timestamp(6), -- when the operation was issued
 	when_ended timestamp(6), -- when the operation ended(either done or failed)
-	job_info varchar(256), -- optional
+	job_info text default null,
 	user_name varchar(128)
 ) ENGINE=InnoDB DEFAULT charset=utf8;
 
@@ -488,19 +501,17 @@ create table cluster_roll_back_record (
 -- table move logs, used to recover from broken procedures of a table-move operation.
 create table table_move_jobs (
 	id serial primary key,
-	table_name varchar(64) not null, -- target table to move
-	-- db name (of storage shard) which contains the target table
-	db_name varchar(150) not null,
-	src_shard int unsigned not null, -- old shard id
+	table_list text default null, -- target table to move
+	src_shard int unsigned default null, -- old shard id
 	-- data source, dumping the table in this node
-	src_shard_node int unsigned not null,
-	dest_shard int unsigned not null, -- new shard id
+	src_shard_node int unsigned default null,
+	dest_shard int unsigned default null, -- new shard id
 	-- the shard node to move into, must be dest_shard's current master
-	dest_shard_node int unsigned not null,
+	dest_shard_node int unsigned default null,
 	-- where to replay binlogs from, replication-starting-point(file)
-	snapshot_binlog_file_idx int unsigned not null,
+	snapshot_binlog_file_idx varchar(256) default null,
 	-- replication-starting-point(offset)
-	snapshot_binlog_file_offset bigint unsigned not null,
+	snapshot_binlog_file_offset bigint unsigned default null,
 
 	-- file format of the table being moved:
 	-- logical: a logical dump produced by tools like mydumper, etc;
@@ -508,7 +519,7 @@ create table table_move_jobs (
 	-- dyn_clone: produced by clone cmd(currently only available in innodb)
 	tab_file_format enum('logical', 'physical', 'dyn_clone') not null,
 	when_started timestamp(6) not null default current_timestamp(6),
-	when_ended timestamp(6),
+	when_ended timestamp(6) NULL default null,
 	status enum('not_started', 'dumped', 'transmitted', 'loaded', 'caught_up', 'renamed', 'rerouted', 'done', 'failed') not null default 'not_started',
 	-- extra info for expanding 
 	memo text default null,
